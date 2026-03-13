@@ -1,9 +1,15 @@
 from pathlib import Path
+from io import BytesIO
 import math
 import numpy as np
 import pandas as pd
 import altair as alt
 import streamlit as st
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 
 st.set_page_config(
     page_title="Restaurant Ratings & Satisfaction Dashboard",
@@ -131,6 +137,208 @@ def make_download(df: pd.DataFrame):
     return df.to_csv(index=False).encode("utf-8")
 
 
+def fmt_num(x, decimals=2):
+    if pd.isna(x):
+        return "NA"
+    return f"{x:,.{decimals}f}"
+
+
+def df_to_table_data(df: pd.DataFrame, max_rows: int = 12):
+    small = df.head(max_rows).copy()
+    for col in small.columns:
+        if pd.api.types.is_float_dtype(small[col]):
+            small[col] = small[col].map(lambda v: fmt_num(v, 2))
+    return [list(small.columns)] + small.astype(str).values.tolist()
+
+
+def build_pdf_report(section_title: str, subtitle: str, bullets: list[str], tables: list[tuple[str, pd.DataFrame]]) -> bytes:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        leftMargin=14 * mm,
+        rightMargin=14 * mm,
+        topMargin=14 * mm,
+        bottomMargin=14 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = styles["Title"]
+    heading_style = styles["Heading2"]
+    body_style = styles["BodyText"]
+    body_style.leading = 14
+    small_style = ParagraphStyle(
+        "SmallBody",
+        parent=styles["BodyText"],
+        fontSize=9,
+        leading=12,
+        spaceAfter=4,
+    )
+
+    story = []
+    story.append(Paragraph("Restaurant Ratings & Satisfaction Dashboard", title_style))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph(section_title, heading_style))
+    story.append(Paragraph(subtitle, body_style))
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Key insights", heading_style))
+    for item in bullets:
+        story.append(Paragraph(f"• {item}", body_style))
+    story.append(Spacer(1, 8))
+
+    for idx, (table_title, table_df) in enumerate(tables):
+        if table_df is None or table_df.empty:
+            continue
+        story.append(Paragraph(table_title, heading_style))
+        table_data = df_to_table_data(table_df, max_rows=12)
+        usable_width = A4[0] - doc.leftMargin - doc.rightMargin
+        col_count = len(table_data[0])
+        col_width = usable_width / max(col_count, 1)
+        pdf_table = Table(table_data, colWidths=[col_width] * col_count, repeatRows=1)
+        pdf_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0F766E")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("LEADING", (0, 0), (-1, -1), 10),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D1D5DB")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#F9FAFB")]),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(pdf_table)
+        story.append(Spacer(1, 8))
+        if idx < len(tables) - 1:
+            story.append(Spacer(1, 4))
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Generated directly from the current dashboard filters.", small_style))
+    doc.build(story)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
+
+
+def overview_report(filtered: pd.DataFrame, cuisine_df: pd.DataFrame, city_df: pd.DataFrame, weighted_rating, avg_satisfaction, avg_reviews, avg_repeat, total_revenue):
+    best_cuisine = cuisine_df.iloc[0] if not cuisine_df.empty else None
+    best_city = city_df.iloc[0] if not city_df.empty else None
+    bullets = [
+        f"Weighted overall rating is {fmt_num(weighted_rating)} across the selected data.",
+        f"Average customer satisfaction is {fmt_num(avg_satisfaction, 1)} and repeat customer rate is {fmt_num(avg_repeat, 1)}%.",
+        f"Average review volume per record is {fmt_num(avg_reviews, 1)} and total revenue is ${fmt_num(total_revenue, 0)}.",
+        f"Top cuisine by weighted rating is {best_cuisine['cuisine_primary']} at {fmt_num(best_cuisine['weighted_rating'])}." if best_cuisine is not None else "No cuisine insight available.",
+        f"Top city benchmark is {best_city['city']} with weighted rating {fmt_num(best_city['weighted_rating'])}." if best_city is not None else "No city benchmark insight available.",
+    ]
+    tables = [
+        ("Top cuisines", cuisine_df[["cuisine_primary", "weighted_rating", "avg_satisfaction", "total_reviews", "restaurants"]].head(8)),
+        ("City benchmark", city_df[["city", "weighted_rating", "avg_satisfaction", "avg_reviews", "complaint_rate", "restaurants"]].head(8)),
+    ]
+    return build_pdf_report(
+        "Overview report",
+        "Executive summary of current performance, benchmark position, and headline KPI levels.",
+        bullets,
+        tables,
+    )
+
+
+def descriptive_report(filtered: pd.DataFrame, cuisine_df: pd.DataFrame, heat_df: pd.DataFrame):
+    top_cuisine = cuisine_df.iloc[0] if not cuisine_df.empty else None
+    best_city_cuisine = heat_df.sort_values("weighted_rating", ascending=False).head(1)
+    price_summary = filtered.groupby("price_range", as_index=False).agg(
+        avg_rating=("overall_rating", "mean"),
+        avg_satisfaction=("customer_satisfaction_score", "mean"),
+        avg_reviews=("total_reviews", "mean")
+    ).sort_values("price_range")
+    review_corr = filtered[["total_reviews", "overall_rating"]].corr().iloc[0, 1]
+    bullets = [
+        f"Highest-performing cuisine is {top_cuisine['cuisine_primary']} with weighted rating {fmt_num(top_cuisine['weighted_rating'])}." if top_cuisine is not None else "No cuisine insight available.",
+        f"Correlation between review count and overall rating is {fmt_num(review_corr)} for the filtered data.",
+        f"Price-range performance is summarized across average rating, satisfaction, and review volume.",
+        f"Best city-cuisine combination is {best_city_cuisine.iloc[0]['city']} - {best_city_cuisine.iloc[0]['cuisine_primary']} at weighted rating {fmt_num(best_city_cuisine.iloc[0]['weighted_rating'])}." if not best_city_cuisine.empty else "No city-cuisine insight available.",
+        f"This report emphasizes what is happening across cuisines, prices, cities, and review volume patterns.",
+    ]
+    tables = [
+        ("Cuisine leaderboard", cuisine_df[["cuisine_primary", "weighted_rating", "avg_satisfaction", "total_reviews", "restaurants"]].head(10)),
+        ("Price range summary", price_summary[["price_range", "avg_rating", "avg_satisfaction", "avg_reviews"]]),
+        ("Top city-cuisine combinations", heat_df[["city", "cuisine_primary", "weighted_rating", "satisfaction", "reviews"]].sort_values("weighted_rating", ascending=False).head(10)),
+    ]
+    return build_pdf_report(
+        "Descriptive analytics report",
+        "Summary of what happened across cuisines, prices, reviews, and cities for the currently selected filters.",
+        bullets,
+        tables,
+    )
+
+
+def diagnostic_report(filtered: pd.DataFrame, driver_df: pd.DataFrame, impact_df: pd.DataFrame):
+    top_driver = driver_df.iloc[0] if not driver_df.empty else None
+    service_drag = impact_df[impact_df["issue_flag"] == "Service drag"].copy()
+    actions = impact_df.groupby("recommended_action", as_index=False).agg(
+        restaurants=("restaurant_id", "nunique"),
+        avg_rating=("overall_rating", "mean"),
+        avg_satisfaction=("customer_satisfaction_score", "mean")
+    ).sort_values("restaurants", ascending=False)
+    bullets = [
+        f"The strongest modeled driver of overall rating is {top_driver['driver']} with standardized impact {fmt_num(top_driver['importance'], 3)}." if top_driver is not None else "No driver insight available.",
+        f"There are {int(service_drag['restaurant_id'].nunique())} restaurants flagged with service drag in the current filter selection.",
+        f"Restaurants are flagged based on relative underperformance versus city average and aspect-rating imbalance.",
+        f"Recommended actions prioritize staffing, pricing-value improvement, complaint investigation, or steady monitoring.",
+        f"This report focuses on why ratings differ rather than only where they differ.",
+    ]
+    tables = [
+        ("Driver importance", driver_df[["driver", "importance", "direction"]]),
+        ("Service-drag restaurants", service_drag[["restaurant_name", "city", "cuisine_primary", "avg_food_rating", "avg_service_rating", "overall_rating", "complaint_rate_pct", "recommended_action"]].sort_values("overall_rating").head(12)),
+        ("Action priority mix", actions[["recommended_action", "restaurants", "avg_rating", "avg_satisfaction"]]),
+    ]
+    return build_pdf_report(
+        "Diagnostic analytics report",
+        "Root-cause analysis of rating performance, service drag, and action priorities for the selected scope.",
+        bullets,
+        tables,
+    )
+
+
+def predictive_report(filtered: pd.DataFrame):
+    bullets = [
+        "This section is currently a roadmap placeholder rather than an active prediction model.",
+        "The current dataset is suitable for next-step models such as overall-rating regression, satisfaction-risk scoring, and review-growth forecasting.",
+        "Repeat customer rate and revenue fields support future lifetime-value and retention-oriented use cases.",
+        "Once real data is connected, this section can estimate future performance by city, cuisine, and restaurant segment.",
+    ]
+    roadmap = pd.DataFrame({
+        "future_model": ["Overall rating prediction", "Satisfaction risk classification", "Review growth forecast", "City-cuisine demand forecast"],
+        "target_field": ["overall_rating", "customer_satisfaction_score", "total_reviews", "total_orders"],
+        "business_value": ["Early quality signal", "Identify declining experiences", "Plan staffing and marketing", "Guide expansion and promotions"]
+    })
+    return build_pdf_report(
+        "Predictive analytics roadmap",
+        "Suggested modeling paths that can be added after the descriptive and diagnostic foundation is validated.",
+        bullets,
+        [("Model roadmap", roadmap)],
+    )
+
+
+def prescriptive_report(filtered: pd.DataFrame):
+    actions = filtered.groupby("recommended_action", as_index=False).agg(
+        restaurants=("restaurant_id", "nunique"),
+        avg_rating=("overall_rating", "mean"),
+        avg_satisfaction=("customer_satisfaction_score", "mean")
+    ).sort_values("restaurants", ascending=False)
+    bullets = [
+        "This section is currently a decision-support roadmap rather than a live optimization engine.",
+        "Recommended actions can be translated into interventions such as staffing fixes, pricing tests, complaint-resolution programs, and promotion strategies.",
+        "A/B tests can later validate whether operational changes improve ratings, satisfaction, and repeat behavior.",
+        "The current dashboard already provides a starting action taxonomy through the recommended_action field.",
+    ]
+    return build_pdf_report(
+        "Prescriptive analytics roadmap",
+        "Suggested action framework for turning analysis into experiments and operational decisions.",
+        bullets,
+        [("Current action opportunities", actions[["recommended_action", "restaurants", "avg_rating", "avg_satisfaction"]])],
+    )
+
+
 if not Path(DATA_FILE).exists():
     st.error(f"Missing data file: {DATA_FILE}. Add it to the repository root before deploying.")
     st.stop()
@@ -204,7 +412,6 @@ heat_df = city_cuisine_heatmap(filtered)
 impact_df = impact_gap(filtered)
 driver_df = driver_importance(filtered)
 
-# Tabs
 intro_tab, desc_tab, diag_tab, pred_tab, pres_tab = st.tabs([
     "Overview", "Descriptive", "Diagnostic", "Predictive Later", "Prescriptive Later"
 ])
@@ -248,6 +455,16 @@ with intro_tab:
         data=make_download(filtered),
         file_name="filtered_restaurant_dashboard_data.csv",
         mime="text/csv"
+    )
+
+    st.divider()
+    overview_pdf = overview_report(filtered, cuisine_df, city_df, weighted_rating, avg_satisfaction, avg_reviews, avg_repeat, total_revenue)
+    st.download_button(
+        "Download Overview PDF report",
+        data=overview_pdf,
+        file_name="overview_report.pdf",
+        mime="application/pdf",
+        key="overview_pdf_btn"
     )
 
 with desc_tab:
@@ -299,6 +516,16 @@ with desc_tab:
     top_right.altair_chart(review_chart, use_container_width=True)
     bottom_left.altair_chart(heatmap, use_container_width=True)
     bottom_right.altair_chart(city_line, use_container_width=True)
+
+    st.divider()
+    desc_pdf = descriptive_report(filtered, cuisine_df, heat_df)
+    st.download_button(
+        "Download Descriptive PDF report",
+        data=desc_pdf,
+        file_name="descriptive_report.pdf",
+        mime="application/pdf",
+        key="descriptive_pdf_btn"
+    )
 
 with diag_tab:
     left, right = st.columns(2)
@@ -370,10 +597,38 @@ with diag_tab:
     ]].sort_values(["overall_rating", "customer_satisfaction_score"], ascending=[True, True])
     st.dataframe(restaurant_detail, use_container_width=True, hide_index=True)
 
+    st.divider()
+    diag_pdf = diagnostic_report(filtered, driver_df, impact_df)
+    st.download_button(
+        "Download Diagnostic PDF report",
+        data=diag_pdf,
+        file_name="diagnostic_report.pdf",
+        mime="application/pdf",
+        key="diagnostic_pdf_btn"
+    )
+
 with pred_tab:
     st.info("Placeholder: later you can add rating prediction, satisfaction risk scoring, CLV-style customer value, and next-period performance forecasting.")
     st.markdown("Suggested next models: overall rating regression, satisfaction classification, review growth forecast, and city-cuisine demand prediction.")
+    st.divider()
+    pred_pdf = predictive_report(filtered)
+    st.download_button(
+        "Download Predictive roadmap PDF",
+        data=pred_pdf,
+        file_name="predictive_roadmap.pdf",
+        mime="application/pdf",
+        key="predictive_pdf_btn"
+    )
 
 with pres_tab:
     st.info("Placeholder: later you can add what-if simulations, intervention prioritization, and experiment tracking.")
     st.markdown("Suggested actions: pricing tests, staffing improvement experiments, targeted promotions, and A/B testing by city or cuisine.")
+    st.divider()
+    pres_pdf = prescriptive_report(filtered)
+    st.download_button(
+        "Download Prescriptive roadmap PDF",
+        data=pres_pdf,
+        file_name="prescriptive_roadmap.pdf",
+        mime="application/pdf",
+        key="prescriptive_pdf_btn"
+    )
